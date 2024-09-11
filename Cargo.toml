@@ -2,11 +2,12 @@
 name = "short_string"
 version = "0.0.1"
 description = "A short string implementation for Rust"
-authors = [ "Jacob R. Green" ]
+authors = ["Jacob R. Green"]
 license = "Apache-2.0"
-license-file = "LICENSE"
 edition = "2021"
 
 [features]
 default = []
-compact = []
+
+[dependencies]
+static_assertions = "1.1"

@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2023. Jacob R. Green
+// Copyright (c) 2023 Jacob R. Green
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,222 +14,395 @@
 // limitations under the License.
 //
 
-use std::ops::Add;
+use static_assertions as sa;
+use std::borrow::Borrow;
+use std::ffi::OsStr;
+use std::fmt::Formatter;
+use std::mem::{ManuallyDrop, MaybeUninit};
+use std::ops::*;
+use std::path::Path;
 
-// 32-byte ShortString
-#[cfg(not(feature = "compact"))]
-pub const INLINE_LENGTH: usize = 30;
+const INLINE_CHAR_COUNT: usize = size_of::<usize>() * 4 - 1;
+const SENTINAL: u8 = 0xFF;
 
-// 24-byte ShortString
-#[cfg(feature = "compact")]
-pub const INLINE_LENGTH: usize = 15;
+const INLINE_AGAIN_LENGTH: usize = INLINE_CHAR_COUNT / 2;
+
+const unsafe fn uninitialized<T>() -> T {
+    unsafe { MaybeUninit::uninit().assume_init() }
+}
 
 #[repr(packed)]
-#[derive(Default, Clone, Copy)]
-struct InlineString {
+#[derive(Default, Copy, Clone)]
+struct Inline {
+    chars: [u8; INLINE_CHAR_COUNT],
     len: u8,
-    buf: [u8; INLINE_LENGTH],
 }
 
-#[derive(Clone)]
-enum ShortStringInner {
-    Inline(InlineString),
-    Heap(String),
-}
-
-impl Default for ShortStringInner {
-    fn default() -> Self {
-        Self::Inline(InlineString::default())
-    }
-}
-
-#[derive(Default, Clone)]
-pub struct ShortString {
-    inner: ShortStringInner,
-}
-
-impl ShortString {
-    pub fn new() -> Self {
-        Self {
-            inner: ShortStringInner::Inline(InlineString {
-                buf: [0; INLINE_LENGTH],
-                len: 0,
-            }),
-        }
+impl Inline {
+    pub const fn new() -> Self {
+        unsafe { std::mem::zeroed() }
     }
 
-    pub fn as_bytes(&self) -> &[u8] {
-        match &self.inner {
-            ShortStringInner::Inline(inlined) => &inlined.buf[..(inlined.len as usize)],
-            ShortStringInner::Heap(buf) => buf.as_bytes(),
-        }
-    }
-
-    pub fn as_mut_str(&mut self) -> &mut str {
-        match &mut self.inner {
-            ShortStringInner::Inline(inlined) => unsafe {
-                std::str::from_utf8_unchecked_mut(&mut inlined.buf[..(inlined.len as usize)])
-            },
-            ShortStringInner::Heap(buf) => unsafe { buf.as_mut_str() },
-        }
+    pub const fn can_inline(s: &str) -> bool {
+        s.len() <= INLINE_CHAR_COUNT
     }
 
     pub fn as_str(&self) -> &str {
-        match &self.inner {
-            ShortStringInner::Inline(inlined) => unsafe {
-                std::str::from_utf8_unchecked(&inlined.buf[..(inlined.len as usize)])
-            },
-            ShortStringInner::Heap(buf) => unsafe { buf.as_str() },
+        unsafe {
+            std::str::from_utf8_unchecked(std::slice::from_raw_parts(
+                self.chars.as_ptr(),
+                self.len as _,
+            ))
         }
     }
 
     pub fn capacity(&self) -> usize {
-        match &self.inner {
-            ShortStringInner::Inline(inlined) => inlined.buf.len(),
-            ShortStringInner::Heap(buf) => buf.capacity(),
+        self.chars.len()
+    }
+
+    pub fn len(&self) -> usize {
+        usize::from(self.len)
+    }
+
+    pub fn clear(&mut self) {
+        self.len = 0
+    }
+
+    fn can_push_str(&self, string: &str) -> bool {
+        self.len() + string.len() <= self.capacity()
+    }
+
+    fn push_str(&mut self, string: &str) {
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                string.as_ptr(),
+                self.chars.as_mut_ptr().add(self.len()),
+                string.len(),
+            )
+        }
+        self.len += string.len() as u8;
+    }
+
+    pub fn try_push_str(&mut self, string: &str) -> Result<(), ()> {
+        if self.can_push_str(string) {
+            self.push_str(string);
+            Ok(())
+        } else {
+            Err(())
+        }
+    }
+}
+
+impl From<&str> for Inline {
+    fn from(value: &str) -> Self {
+        unsafe {
+            let mut s: Inline = uninitialized();
+            s.len = u8::try_from(value.len()).unwrap();
+            std::ptr::copy_nonoverlapping(value.as_ptr(), s.chars.as_mut_ptr(), value.len());
+            s
+        }
+    }
+}
+
+impl std::fmt::Debug for Inline {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        <str as std::fmt::Debug>::fmt(self.as_str(), f)
+    }
+}
+
+impl std::fmt::Display for Inline {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        <str as std::fmt::Display>::fmt(self.as_str(), f)
+    }
+}
+
+const PADDING: usize = size_of::<usize>() - 1;
+
+#[derive(Clone)]
+struct Heap {
+    vec: String,
+    #[allow(unused)]
+    pad: [u8; PADDING],
+    #[allow(unused)]
+    flag: u8,
+}
+
+impl Heap {
+    pub fn as_str(&self) -> &str {
+        self.vec.as_str()
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.vec.capacity()
+    }
+
+    pub fn len(&self) -> usize {
+        self.vec.len()
+    }
+
+    pub fn clear(&mut self) {
+        self.vec.clear()
+    }
+
+    pub fn push_str(&mut self, string: &str) {
+        self.vec.push_str(string);
+    }
+}
+
+impl From<String> for Heap {
+    fn from(value: String) -> Self {
+        Self {
+            vec: value,
+            pad: unsafe { uninitialized() },
+            flag: SENTINAL,
+        }
+    }
+}
+
+impl std::fmt::Debug for Heap {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        <String as std::fmt::Debug>::fmt(&self.vec, f)
+    }
+}
+
+impl std::fmt::Display for Heap {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        <String as std::fmt::Display>::fmt(&self.vec, f)
+    }
+}
+
+sa::assert_eq_size!(Inline, Heap);
+
+pub union ShortString {
+    inline: Inline,
+    heap: ManuallyDrop<Heap>,
+}
+
+enum UnionVariant<'a> {
+    Inline(&'a Inline),
+    Heap(&'a Heap),
+}
+
+enum UnionVariantMut<'a> {
+    Inline(&'a mut Inline),
+    Heap(&'a mut Heap),
+}
+
+impl ShortString {
+    pub const fn new() -> Self {
+        Self {
+            inline: Inline::new(),
+        }
+    }
+
+    pub const fn is_inline(&self) -> bool {
+        unsafe { self.inline.len != SENTINAL }
+    }
+
+    #[inline(always)]
+    fn variant(&self) -> UnionVariant {
+        unsafe {
+            if self.is_inline() {
+                UnionVariant::Inline(&self.inline)
+            } else {
+                UnionVariant::Heap(&self.heap)
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn variant_mut(&mut self) -> UnionVariantMut {
+        unsafe {
+            if self.is_inline() {
+                UnionVariantMut::Inline(&mut self.inline)
+            } else {
+                UnionVariantMut::Heap(&mut self.heap)
+            }
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        match self.variant() {
+            UnionVariant::Inline(inline) => inline.as_str(),
+            UnionVariant::Heap(heap) => heap.as_str(),
+        }
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        self.as_str().as_bytes()
+    }
+
+    pub fn capacity(&self) -> usize {
+        match self.variant() {
+            UnionVariant::Inline(inline) => inline.capacity(),
+            UnionVariant::Heap(heap) => heap.capacity(),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        match self.variant() {
+            UnionVariant::Inline(inline) => inline.len(),
+            UnionVariant::Heap(heap) => heap.len(),
         }
     }
 
     pub fn clear(&mut self) {
-        match &mut self.inner {
-            ShortStringInner::Inline(inlined) => {
-                inlined.len = 0;
-            }
-            ShortStringInner::Heap(buf) => {
-                buf.clear();
-            }
+        match self.variant_mut() {
+            UnionVariantMut::Inline(inline) => inline.clear(),
+            UnionVariantMut::Heap(heap) => heap.clear(),
         }
     }
 
-    pub fn into_string(self) -> String {
-        match self.inner {
-            ShortStringInner::Inline(inlined) => unsafe {
-                String::from_utf8_unchecked(Vec::from(&inlined.buf[..(inlined.len as usize)]))
-            },
-            ShortStringInner::Heap(buf) => buf,
-        }
-    }
-
-    pub fn push(&mut self, ch: char) {
-        match &mut self.inner {
-            ShortStringInner::Inline(inlined) => {
-                let mut bytes = [0u8; 4];
-                let ch_bytes = ch.encode_utf8(&mut bytes).as_bytes();
-
-                let length = inlined.len as usize;
-
-                if length + ch_bytes.len() > inlined.buf.len() {
-                    self.inner = ShortStringInner::Heap(unsafe {
-                        String::from_utf8_unchecked(Vec::from(&inlined.buf[..(length as usize)]))
-                    });
-                    self.push(ch);
-                } else {
-                    inlined.buf[length..length + ch_bytes.len()].copy_from_slice(ch_bytes);
-                    inlined.len += ch_bytes.len() as u8;
+    pub fn push_str(&mut self, string: &str) {
+        match self.variant_mut() {
+            UnionVariantMut::Inline(inline) => {
+                if let Err(_) = inline.try_push_str(string) {
+                    let mut s = String::new();
+                    s.reserve(inline.len() + string.len());
+                    s.push_str(inline.as_str());
+                    s.push_str(string);
+                    self.heap = ManuallyDrop::new(s.into())
                 }
             }
-            ShortStringInner::Heap(string) => string.push(ch),
+            UnionVariantMut::Heap(heap) => {
+                heap.push_str(string);
+            }
+        }
+    }
+
+    pub fn push(&mut self, c: char) {
+        let mut buffer: [u8; 4] = unsafe { uninitialized() };
+        let string = c.encode_utf8(&mut buffer);
+        self.push_str(string)
+    }
+}
+
+impl Default for ShortString {
+    fn default() -> Self {
+        Self {
+            inline: Default::default(),
         }
     }
 }
 
-impl Add<&str> for ShortString {
-    type Output = Self;
-
-    fn add(mut self, rhs: &str) -> Self::Output {
-        self.push_str(rhs);
-        self
+impl Drop for ShortString {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.is_inline() {
+                ManuallyDrop::drop(&mut self.heap)
+            }
+        }
     }
 }
 
-impl std::fmt::Debug for ShortString {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
+impl Clone for ShortString {
+    fn clone(&self) -> Self {
+        match self.variant() {
+            UnionVariant::Inline(inline) => Self {
+                inline: inline.clone(),
+            },
+            UnionVariant::Heap(heap) => Self {
+                heap: ManuallyDrop::new(heap.clone()),
+            },
+        }
     }
 }
 
-impl std::fmt::Display for ShortString {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
+impl From<&str> for ShortString {
+    fn from(value: &str) -> Self {
+        Inline::can_inline(value)
+            .then(|| Self {
+                inline: Inline::from(value),
+            })
+            .unwrap_or_else(|| Self {
+                heap: ManuallyDrop::new(Heap::from(value.to_owned())),
+            })
     }
 }
 
-impl PartialEq for ShortString {
-    fn eq(&self, other: &Self) -> bool {
-        self.as_str() == other.as_str()
+impl From<String> for ShortString {
+    fn from(value: String) -> Self {
+        Inline::can_inline(&value)
+            .then(|| Self {
+                inline: Inline::from(value.as_str()),
+            })
+            .unwrap_or_else(|| Self {
+                heap: ManuallyDrop::new(Heap::from(value)),
+            })
     }
 }
 
-impl Eq for ShortString {}
-
-impl PartialOrd for ShortString {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        self.as_str().partial_cmp(other.as_str())
-    }
-}
-
-impl Ord for ShortString {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.as_str().cmp(other.as_str())
-    }
-}
-
-impl std::hash::Hash for ShortString {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.as_str().hash(state)
-    }
-}
-
-impl std::ops::Deref for ShortString {
+impl Deref for ShortString {
     type Target = str;
-
     fn deref(&self) -> &Self::Target {
         self.as_str()
     }
 }
 
-impl From<&str> for ShortString {
-    fn from(s: &str) -> Self {
-        let len = s.len();
-        if len <= INLINE_LENGTH {
-            let mut buf = [0; INLINE_LENGTH];
-            buf[..len].copy_from_slice(s.as_bytes());
-            Self {
-                inner: ShortStringInner::Inline(InlineString {
-                    buf,
-                    len: len as u8,
-                }),
-            }
-        } else {
-            Self {
-                inner: ShortStringInner::Heap(s.into()),
-            }
-        }
+impl AsRef<OsStr> for ShortString {
+    fn as_ref(&self) -> &OsStr {
+        OsStr::new(self.as_str())
     }
 }
 
-impl From<String> for ShortString {
-    fn from(s: String) -> Self {
-        Self {
-            inner: ShortStringInner::Heap(s),
-        }
+impl AsRef<Path> for ShortString {
+    fn as_ref(&self) -> &Path {
+        Path::new(self.as_str())
     }
 }
 
-impl From<&String> for ShortString {
-    fn from(s: &String) -> Self {
-        Self::from(s.as_str())
+impl AsRef<[u8]> for ShortString {
+    fn as_ref(&self) -> &[u8] {
+        self.as_bytes()
     }
 }
 
-impl Into<String> for ShortString {
-    fn into(self) -> String {
-        self.into_string()
-    }
-}
-
-impl AsRef<str> for ShortString {
-    fn as_ref(&self) -> &str {
+impl Borrow<str> for ShortString {
+    fn borrow(&self) -> &str {
         self.as_str()
+    }
+}
+
+impl Add<&str> for ShortString {
+    type Output = Self;
+    fn add(mut self, rhs: &str) -> Self::Output {
+        self += rhs;
+        self
+    }
+}
+
+impl AddAssign<&str> for ShortString {
+    fn add_assign(&mut self, rhs: &str) {
+        self.push_str(rhs);
+    }
+}
+
+impl Extend<char> for ShortString {
+    fn extend<T: IntoIterator<Item = char>>(&mut self, iter: T) {
+        iter.into_iter().for_each(|c| self.push(c));
+    }
+}
+
+impl<'a> Extend<&'a str> for ShortString {
+    fn extend<T: IntoIterator<Item = &'a str>>(&mut self, iter: T) {
+        iter.into_iter().for_each(|s| self.push_str(s));
+    }
+}
+
+impl std::fmt::Debug for ShortString {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self.variant() {
+            UnionVariant::Inline(inline) => <Inline as std::fmt::Debug>::fmt(inline, f),
+            UnionVariant::Heap(heap) => <Heap as std::fmt::Debug>::fmt(heap, f),
+        }
+    }
+}
+
+impl std::fmt::Display for ShortString {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self.variant() {
+            UnionVariant::Inline(inline) => <Inline as std::fmt::Display>::fmt(inline, f),
+            UnionVariant::Heap(heap) => <Heap as std::fmt::Display>::fmt(heap, f),
+        }
     }
 }
